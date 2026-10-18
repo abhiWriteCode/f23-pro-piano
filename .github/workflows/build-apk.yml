@@ -7,28 +7,33 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout Source Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Provision Gradle 8.7 (No Wrapper Required)
+      - name: Ensure gradle.properties has AndroidX enabled
+        run: |
+          echo "android.useAndroidX=true" >> gradle.properties
+          echo "android.nonTransitiveRClass=true" >> gradle.properties
+
+      - name: Provision Gradle 8.7
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
 
       - name: Build Debug APK
-        run: gradle assembleDebug --no-daemon
+        run: gradle assembleDebug --no-daemon --stacktrace
 
       - name: Upload Compiled APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: F23-Pro-Piano-APK
           path: app/build/outputs/apk/debug/app-debug.apk
