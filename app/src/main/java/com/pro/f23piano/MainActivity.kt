@@ -1,5 +1,7 @@
 package com.pro.f23piano
 
+import android.graphics.Paint
+import android.graphics.Typeface
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
@@ -19,6 +21,7 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
@@ -27,10 +30,31 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.exp
 import kotlin.math.pow
 import kotlin.math.sin
+
+enum class Instrument(val label: String) {
+    GRAND("Grand"),
+    EPIANO("E-Piano"),
+    SYNTH("Synth"),
+    ORGAN("Organ")
+}
+
+enum class LoopState {
+    IDLE, RECORDING, PLAYING
+}
+
+data class RecordedNote(
+    val timeOffsetMs: Long,
+    val noteOffset: Int,
+    val octaveShift: Int,
+    val instrument: Instrument,
+    val sustainEnabled: Boolean
+)
 
 data class PianoKey(
     val noteOffset: Int,
@@ -42,47 +66,108 @@ data class PianoKey(
 class SynthEngine {
     private val sampleRate = 44100
     private val scope = CoroutineScope(Dispatchers.Default)
+    private val activeTracks = ConcurrentLinkedQueue<AudioTrack>()
 
-    fun playNote(semitoneFromA4: Int, sustainMultiplier: Double = 1.0) {
+    fun playNote(
+        semitoneFromA4: Int,
+        instrument: Instrument,
+        sustainMultiplier: Double = 1.0
+    ) {
         scope.launch {
             val freq = 440.0 * 2.0.pow(semitoneFromA4 / 12.0)
-            val durationSeconds = (1.6 * sustainMultiplier).coerceAtMost(3.5)
+            val durationSeconds = when (instrument) {
+                Instrument.ORGAN -> (1.1 * sustainMultiplier).coerceAtMost(2.5)
+                Instrument.SYNTH -> (1.2 * sustainMultiplier).coerceAtMost(2.6)
+                else -> (1.5 * sustainMultiplier).coerceAtMost(3.2)
+            }
             val numSamples = (durationSeconds * sampleRate).toInt()
             val buffer = ShortArray(numSamples)
 
             for (i in 0 until numSamples) {
                 val t = i.toDouble() / sampleRate
-                val envelope = exp(-3.2 * t / sustainMultiplier) * (1.0 - exp(-200.0 * t))
-                val wave = (0.60 * sin(2.0 * Math.PI * freq * t) +
-                            0.25 * sin(4.0 * Math.PI * freq * t) +
-                            0.10 * sin(6.0 * Math.PI * freq * t) +
-                            0.05 * sin(8.0 * Math.PI * freq * t))
-                buffer[i] = (wave * envelope * Short.MAX_VALUE * 0.45).toInt().toShort()
+                val sample = when (instrument) {
+                    Instrument.GRAND -> {
+                        val env = exp(-3.2 * t / sustainMultiplier) * (1.0 - exp(-220.0 * t))
+                        val wave = 0.60 * sin(2.0 * Math.PI * freq * t) +
+                                   0.25 * sin(4.0 * Math.PI * freq * t) +
+                                   0.10 * sin(6.0 * Math.PI * freq * t) +
+                                   0.05 * sin(8.0 * Math.PI * freq * t)
+                        wave * env
+                    }
+                    Instrument.EPIANO -> {
+                        val bodyEnv = exp(-2.4 * t / sustainMultiplier) * (1.0 - exp(-180.0 * t))
+                        val tineEnv = exp(-22.0 * t)
+                        val tremolo = 1.0 + 0.18 * sin(2.0 * Math.PI * 5.5 * t)
+                        val body = 0.65 * sin(2.0 * Math.PI * freq * t) +
+                                   0.20 * sin(4.0 * Math.PI * freq * t) +
+                                   0.08 * sin(6.0 * Math.PI * freq * t)
+                        val tine = 0.22 * sin(2.0 * Math.PI * freq * 7.0 * t) * tineEnv
+                        (body * bodyEnv + tine) * tremolo
+                    }
+                    Instrument.SYNTH -> {
+                        val env = exp(-2.0 * t / sustainMultiplier) * (1.0 - exp(-90.0 * t))
+                        val f1 = freq * 0.996
+                        val f2 = freq * 1.004
+                        var saw = 0.0
+                        for (h in 1..6) {
+                            saw += (sin(2.0 * Math.PI * f1 * h * t) + sin(2.0 * Math.PI * f2 * h * t)) / h
+                        }
+                        saw * 0.35 * env
+                    }
+                    Instrument.ORGAN -> {
+                        val fadeOut = if (t > durationSeconds - 0.08) ((durationSeconds - t) / 0.08).coerceIn(0.0, 1.0) else 1.0
+                        val env = (1.0 - exp(-140.0 * t)) * fadeOut
+                        val vibrato = 1.0 + 0.0025 * sin(2.0 * Math.PI * 6.2 * t)
+                        val vf = freq * vibrato
+                        val drawbars = 0.30 * sin(2.0 * Math.PI * (vf * 0.5) * t) +
+                                       0.45 * sin(2.0 * Math.PI * vf * t) +
+                                       0.22 * sin(2.0 * Math.PI * (vf * 1.5) * t) +
+                                       0.25 * sin(2.0 * Math.PI * (vf * 2.0) * t) +
+                                       0.15 * sin(2.0 * Math.PI * (vf * 3.0) * t) +
+                                       0.12 * sin(2.0 * Math.PI * (vf * 4.0) * t) +
+                                       0.08 * sin(2.0 * Math.PI * (vf * 6.0) * t)
+                        drawbars * 0.65 * env
+                    }
+                }
+                buffer[i] = (sample.coerceIn(-1.0, 1.0) * Short.MAX_VALUE * 0.48).toInt().toShort()
             }
 
-            val track = AudioTrack.Builder()
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_GAME)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                        .build()
-                )
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(sampleRate)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                        .build()
-                )
-                .setBufferSizeInBytes(buffer.size * 2)
-                .setTransferMode(AudioTrack.MODE_STATIC)
-                .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
-                .build()
+            // Recycle oldest AudioTrack during fast glissandos to prevent voice exhaustion
+            while (activeTracks.size >= 14) {
+                val oldest = activeTracks.poll()
+                runCatching {
+                    oldest?.stop()
+                    oldest?.release()
+                }
+            }
 
-            track.write(buffer, 0, buffer.size)
-            track.play()
-            delay((durationSeconds * 1000).toLong() + 100)
-            track.release()
+            runCatching {
+                val track = AudioTrack.Builder()
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_GAME)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build()
+                    )
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(buffer.size * 2)
+                    .setTransferMode(AudioTrack.MODE_STATIC)
+                    .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                    .build()
+
+                activeTracks.add(track)
+                track.write(buffer, 0, buffer.size)
+                track.play()
+                delay((durationSeconds * 1000).toLong() + 80)
+                activeTracks.remove(track)
+                track.release()
+            }
         }
     }
 }
@@ -103,70 +188,276 @@ class MainActivity : ComponentActivity() {
 fun PianoAppScreen(synth: SynthEngine) {
     var octaveShift by remember { mutableStateOf(0) }
     var sustainEnabled by remember { mutableStateOf(true) }
+    var showNoteNames by remember { mutableStateOf(true) }
+    var currentInstrument by remember { mutableStateOf(Instrument.GRAND) }
+
+    // Loop Recorder State
+    var loopState by remember { mutableStateOf(LoopState.IDLE) }
+    var recordStartTimeMs by remember { mutableStateOf(0L) }
+    var loopDurationMs by remember { mutableStateOf(0L) }
+    val recordedNotes = remember { mutableStateListOf<RecordedNote>() }
+    val loopActiveKeys = remember { mutableStateListOf<Int>() }
+
+    // Multi-touch pointer tracking map (pointerId -> noteOffset) for smooth glissando
+    val pointerToKey = remember { mutableStateMapOf<Int, Int>() }
     var canvasSize by remember { mutableStateOf(IntSize(2408, 1080)) }
-    val activeKeys = remember { mutableStateListOf<Int>() }
     val keys = remember { buildTwoOctaveLayout() }
 
+    val whiteKeyTextPaint = remember {
+        Paint().apply {
+            color = android.graphics.Color.rgb(45, 45, 45)
+            textSize = 30f
+            textAlign = Paint.Align.CENTER
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            isAntiAlias = true
+        }
+    }
+
+    val blackKeyTextPaint = remember {
+        Paint().apply {
+            color = android.graphics.Color.rgb(220, 235, 255)
+            textSize = 23f
+            textAlign = Paint.Align.CENTER
+            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            isAntiAlias = true
+        }
+    }
+
+    // Coroutine for continuous Loop Playback
+    LaunchedEffect(loopState) {
+        if (loopState == LoopState.PLAYING && recordedNotes.isNotEmpty() && loopDurationMs > 0L) {
+            val snapshot = recordedNotes.toList().sortedBy { it.timeOffsetMs }
+            while (isActive && loopState == LoopState.PLAYING) {
+                var elapsedMs = 0L
+                for (event in snapshot) {
+                    if (loopState != LoopState.PLAYING) break
+                    val waitTime = (event.timeOffsetMs - elapsedMs).coerceAtLeast(0L)
+                    if (waitTime > 0L) delay(waitTime)
+                    elapsedMs = event.timeOffsetMs
+
+                    if (loopState == LoopState.PLAYING) {
+                        synth.playNote(
+                            semitoneFromA4 = event.noteOffset + (event.octaveShift * 12),
+                            instrument = event.instrument,
+                            sustainMultiplier = if (event.sustainEnabled) 1.7 else 0.7
+                        )
+                        launch {
+                            loopActiveKeys.add(event.noteOffset)
+                            delay(180L)
+                            loopActiveKeys.remove(event.noteOffset)
+                        }
+                    }
+                }
+                val remaining = (loopDurationMs - elapsedMs).coerceAtLeast(50L)
+                delay(remaining)
+            }
+        } else {
+            loopActiveKeys.clear()
+        }
+    }
+
+    fun triggerNote(noteOffset: Int) {
+        synth.playNote(
+            semitoneFromA4 = noteOffset + (octaveShift * 12),
+            instrument = currentInstrument,
+            sustainMultiplier = if (sustainEnabled) 1.7 else 0.7
+        )
+        if (loopState == LoopState.RECORDING) {
+            val now = System.currentTimeMillis()
+            if (recordedNotes.isEmpty()) {
+                recordStartTimeMs = now
+            }
+            recordedNotes.add(
+                RecordedNote(
+                    timeOffsetMs = (now - recordStartTimeMs).coerceAtLeast(0L),
+                    noteOffset = noteOffset,
+                    octaveShift = octaveShift,
+                    instrument = currentInstrument,
+                    sustainEnabled = sustainEnabled
+                )
+            )
+        }
+    }
+
+    val compactPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+
     Column(modifier = Modifier.fillMaxSize().background(Color(0xFF121212))) {
+        // Top Studio Control Bar
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(52.dp)
-                .background(Color(0xFF1F1F1F))
-                .padding(horizontal = 16.dp),
+                .height(58.dp)
+                .background(Color(0xFF1E1E1E))
+                .padding(horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Text("SAMSUNG F23 STUDIO GRAND", color = Color(0xFFE0E0E0), fontSize = 15.sp)
-
+            // 1. Instrument Selector Buttons
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Button(onClick = { if (octaveShift > -2) octaveShift-- }) { Text("- Oct") }
-                Text(
-                    " Octave: ${if (octaveShift >= 0) "+$octaveShift" else octaveShift} ",
-                    color = Color.White,
-                    modifier = Modifier.padding(horizontal = 8.dp)
-                )
-                Button(onClick = { if (octaveShift < 2) octaveShift++ }) { Text("+ Oct") }
+                Instrument.values().forEach { inst ->
+                    val selected = currentInstrument == inst
+                    Button(
+                        onClick = { currentInstrument = inst },
+                        contentPadding = compactPadding,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (selected) Color(0xFF1976D2) else Color(0xFF333333)
+                        ),
+                        modifier = Modifier.padding(end = 4.dp).height(38.dp)
+                    ) {
+                        Text(inst.label, fontSize = 12.sp, color = Color.White)
+                    }
+                }
             }
 
+            // 2. Octave & Note Label Toggle
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Sustain", color = Color.LightGray, modifier = Modifier.padding(end = 6.dp))
-                Switch(checked = sustainEnabled, onCheckedChange = { sustainEnabled = it })
+                Button(
+                    onClick = { if (octaveShift > -2) octaveShift-- },
+                    contentPadding = compactPadding,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF333333)),
+                    modifier = Modifier.height(38.dp)
+                ) { Text("-Oct", fontSize = 12.sp) }
+
+                Text(
+                    text = " ${if (octaveShift >= 0) "+$octaveShift" else octaveShift} ",
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    modifier = Modifier.padding(horizontal = 4.dp)
+                )
+
+                Button(
+                    onClick = { if (octaveShift < 2) octaveShift++ },
+                    contentPadding = compactPadding,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF333333)),
+                    modifier = Modifier.padding(end = 6.dp).height(38.dp)
+                ) { Text("+Oct", fontSize = 12.sp) }
+
+                // Single Enable/Disable Button for Note Names
+                Button(
+                    onClick = { showNoteNames = !showNoteNames },
+                    contentPadding = compactPadding,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (showNoteNames) Color(0xFF00897B) else Color(0xFF424242)
+                    ),
+                    modifier = Modifier.padding(end = 6.dp).height(38.dp)
+                ) {
+                    Text(if (showNoteNames) "Notes: ON" else "Notes: OFF", fontSize = 12.sp)
+                }
+
+                // Sustain Toggle
+                Button(
+                    onClick = { sustainEnabled = !sustainEnabled },
+                    contentPadding = compactPadding,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (sustainEnabled) Color(0xFF5E35B1) else Color(0xFF424242)
+                    ),
+                    modifier = Modifier.height(38.dp)
+                ) {
+                    Text(if (sustainEnabled) "Sus: ON" else "Sus: OFF", fontSize = 12.sp)
+                }
+            }
+
+            // 3. Built-in Loop Recorder Controls
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                when (loopState) {
+                    LoopState.IDLE -> {
+                        Button(
+                            onClick = {
+                                recordedNotes.clear()
+                                recordStartTimeMs = System.currentTimeMillis()
+                                loopState = LoopState.RECORDING
+                            },
+                            contentPadding = compactPadding,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828)),
+                            modifier = Modifier.height(38.dp)
+                        ) {
+                            Text("● REC", fontSize = 12.sp, color = Color.White)
+                        }
+                        if (recordedNotes.isNotEmpty()) {
+                            Button(
+                                onClick = { loopState = LoopState.PLAYING },
+                                contentPadding = compactPadding,
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+                                modifier = Modifier.padding(start = 4.dp).height(38.dp)
+                            ) {
+                                Text("▶ LOOP", fontSize = 12.sp, color = Color.White)
+                            }
+                        }
+                    }
+                    LoopState.RECORDING -> {
+                        Button(
+                            onClick = {
+                                if (recordedNotes.isEmpty()) {
+                                    loopState = LoopState.IDLE
+                                } else {
+                                    loopDurationMs = (System.currentTimeMillis() - recordStartTimeMs).coerceAtLeast(400L)
+                                    loopState = LoopState.PLAYING
+                                }
+                            },
+                            contentPadding = compactPadding,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF6C00)),
+                            modifier = Modifier.height(38.dp)
+                        ) {
+                            Text("▶ START LOOP (${recordedNotes.size})", fontSize = 12.sp, color = Color.White)
+                        }
+                    }
+                    LoopState.PLAYING -> {
+                        Button(
+                            onClick = { loopState = LoopState.IDLE },
+                            contentPadding = compactPadding,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF455A64)),
+                            modifier = Modifier.height(38.dp)
+                        ) {
+                            Text("■ STOP LOOP", fontSize = 12.sp, color = Color.White)
+                        }
+                    }
+                }
             }
         }
 
+        // Multi-Touch + Glissando Piano Canvas
         Box(modifier = Modifier.fillMaxSize()) {
             Canvas(
                 modifier = Modifier
                     .fillMaxSize()
                     .onSizeChanged { canvasSize = it }
                     .pointerInteropFilter { event ->
-                        val action = event.actionMasked
-                        val pointerIndex = event.actionIndex
+                        val w = canvasSize.width.toFloat().coerceAtLeast(1f)
+                        val h = canvasSize.height.toFloat().coerceAtLeast(1f)
 
-                        when (action) {
+                        when (event.actionMasked) {
                             MotionEvent.ACTION_DOWN,
-                            MotionEvent.ACTION_POINTER_DOWN -> {
-                                val x = event.getX(pointerIndex)
-                                val y = event.getY(pointerIndex)
-                                val hitKey = detectKeyHit(
-                                    x, y,
-                                    canvasSize.width.toFloat().coerceAtLeast(1f),
-                                    canvasSize.height.toFloat().coerceAtLeast(1f),
-                                    keys
-                                )
-                                if (hitKey != null && !activeKeys.contains(hitKey.noteOffset)) {
-                                    activeKeys.add(hitKey.noteOffset)
-                                    synth.playNote(
-                                        hitKey.noteOffset + (octaveShift * 12),
-                                        if (sustainEnabled) 1.8 else 0.7
-                                    )
+                            MotionEvent.ACTION_POINTER_DOWN,
+                            MotionEvent.ACTION_MOVE -> {
+                                val currentPointerIds = mutableSetOf<Int>()
+                                for (i in 0 until event.pointerCount) {
+                                    val pid = event.getPointerId(i)
+                                    currentPointerIds.add(pid)
+                                    val x = event.getX(i)
+                                    val y = event.getY(i)
+                                    val hitKey = detectKeyHit(x, y, w, h, keys)
+                                    val prevNote = pointerToKey[pid]
+
+                                    if (hitKey != null) {
+                                        if (prevNote != hitKey.noteOffset) {
+                                            pointerToKey[pid] = hitKey.noteOffset
+                                            triggerNote(hitKey.noteOffset)
+                                        }
+                                    } else {
+                                        pointerToKey.remove(pid)
+                                    }
                                 }
+                                // Clean up any stale pointers
+                                val stale = pointerToKey.keys.filter { it !in currentPointerIds }
+                                stale.forEach { pointerToKey.remove(it) }
+                            }
+                            MotionEvent.ACTION_POINTER_UP -> {
+                                val liftedPid = event.getPointerId(event.actionIndex)
+                                pointerToKey.remove(liftedPid)
                             }
                             MotionEvent.ACTION_UP,
-                            MotionEvent.ACTION_POINTER_UP,
                             MotionEvent.ACTION_CANCEL -> {
-                                activeKeys.clear()
+                                pointerToKey.clear()
                             }
                         }
                         true
@@ -174,29 +465,83 @@ fun PianoAppScreen(synth: SynthEngine) {
             ) {
                 val w = size.width
                 val h = size.height
+                val pressedNotes = pointerToKey.values.toSet()
+                val loopingNotes = loopActiveKeys.toSet()
 
+                // 1. Draw White Keys
                 keys.filter { !it.isBlack }.forEach { key ->
-                    val isPressed = activeKeys.contains(key.noteOffset)
+                    val isFingerPressed = key.noteOffset in pressedNotes
+                    val isLoopPressed = key.noteOffset in loopingNotes
+                    val keyColor = when {
+                        isFingerPressed -> Color(0xFF64B5F6)
+                        isLoopPressed -> Color(0xFF81C784)
+                        else -> Color(0xFFFDFDFD)
+                    }
+
+                    val left = key.xStartRatio * w + 2f
+                    val keyWidth = (key.xEndRatio - key.xStartRatio) * w - 4f
+                    val keyHeight = h - 6f
+
                     drawRoundRect(
-                        color = if (isPressed) Color(0xFF90CAF9) else Color(0xFFFDFDFD),
-                        topLeft = Offset(key.xStartRatio * w + 2f, 0f),
-                        size = Size((key.xEndRatio - key.xStartRatio) * w - 4f, h - 6f),
+                        color = keyColor,
+                        topLeft = Offset(left, 0f),
+                        size = Size(keyWidth, keyHeight),
                         cornerRadius = CornerRadius(10f, 10f)
                     )
+
+                    if (showNoteNames) {
+                        val label = formatNoteName(key.noteOffset, octaveShift)
+                        drawContext.canvas.nativeCanvas.drawText(
+                            label,
+                            left + keyWidth / 2f,
+                            keyHeight - 34f,
+                            whiteKeyTextPaint
+                        )
+                    }
                 }
 
+                // 2. Draw Black Keys
                 keys.filter { it.isBlack }.forEach { key ->
-                    val isPressed = activeKeys.contains(key.noteOffset)
+                    val isFingerPressed = key.noteOffset in pressedNotes
+                    val isLoopPressed = key.noteOffset in loopingNotes
+                    val keyColor = when {
+                        isFingerPressed -> Color(0xFF1E88E5)
+                        isLoopPressed -> Color(0xFF2E7D32)
+                        else -> Color(0xFF141414)
+                    }
+
+                    val left = key.xStartRatio * w
+                    val keyWidth = (key.xEndRatio - key.xStartRatio) * w
+                    val keyHeight = h * 0.60f
+
                     drawRoundRect(
-                        color = if (isPressed) Color(0xFF37474F) else Color(0xFF141414),
-                        topLeft = Offset(key.xStartRatio * w, 0f),
-                        size = Size((key.xEndRatio - key.xStartRatio) * w, h * 0.60f),
+                        color = keyColor,
+                        topLeft = Offset(left, 0f),
+                        size = Size(keyWidth, keyHeight),
                         cornerRadius = CornerRadius(8f, 8f)
                     )
+
+                    if (showNoteNames) {
+                        val label = formatNoteName(key.noteOffset, octaveShift)
+                        drawContext.canvas.nativeCanvas.drawText(
+                            label,
+                            left + keyWidth / 2f,
+                            keyHeight - 24f,
+                            blackKeyTextPaint
+                        )
+                    }
                 }
             }
         }
     }
+}
+
+fun formatNoteName(noteOffset: Int, octaveShift: Int): String {
+    val midiNote = 69 + noteOffset + (octaveShift * 12)
+    val names = arrayOf("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+    val name = names[((midiNote % 12) + 12) % 12]
+    val octave = (midiNote / 12) - 1
+    return "$name$octave"
 }
 
 fun detectKeyHit(x: Float, y: Float, w: Float, h: Float, keys: List<PianoKey>): PianoKey? {
