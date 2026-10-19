@@ -187,7 +187,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun PianoAppScreen(synth: SynthEngine) {
     var octaveShift by remember { mutableStateOf(0) }
-    var sustainEnabled by remember { mutableStateOf(true) }
+    var sustainEnabled by remember { mutableStateOf(false) }
     var showNoteNames by remember { mutableStateOf(true) }
     var currentInstrument by remember { mutableStateOf(Instrument.GRAND) }
 
