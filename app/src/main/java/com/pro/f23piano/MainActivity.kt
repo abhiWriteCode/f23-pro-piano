@@ -32,6 +32,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.exp
 import kotlin.math.pow
@@ -41,7 +42,7 @@ enum class Instrument(val label: String) {
     GRAND("Grand"),
     EPIANO("E-Piano"),
     SYNTH("Synth"),
-    ORGAN("Organ")
+    HARMONIUM("Harmonium")
 }
 
 enum class LoopState {
@@ -53,7 +54,8 @@ data class RecordedNote(
     val noteOffset: Int,
     val octaveShift: Int,
     val instrument: Instrument,
-    val sustainEnabled: Boolean
+    val sustainEnabled: Boolean,
+    var holdDurationMs: Long = 400L
 )
 
 data class PianoKey(
@@ -63,86 +65,55 @@ data class PianoKey(
     val xEndRatio: Float
 )
 
+class ActiveVoice(
+    val noteId: Int,
+    val sustainEnabled: Boolean
+) {
+    @Volatile var isReleased: Boolean = false
+    @Volatile var isForceStopped: Boolean = false
+}
+
 class SynthEngine {
     private val sampleRate = 44100
     private val scope = CoroutineScope(Dispatchers.Default)
-    private val activeTracks = ConcurrentLinkedQueue<AudioTrack>()
+    private val heldVoices = ConcurrentHashMap<Int, ActiveVoice>()
+    private val allRunningVoices = ConcurrentLinkedQueue<ActiveVoice>()
 
-    fun playNote(
+    fun startNote(
+        noteId: Int,
         semitoneFromA4: Int,
         instrument: Instrument,
-        sustainMultiplier: Double = 1.0
+        sustainEnabled: Boolean
     ) {
+        // Release any existing voice on this same key before starting a new one
+        heldVoices.remove(noteId)?.let { oldVoice ->
+            oldVoice.isReleased = true
+        }
+
+        val voice = ActiveVoice(noteId, sustainEnabled)
+        heldVoices[noteId] = voice
+        allRunningVoices.add(voice)
+
+        // Prevent hardware AudioTrack exhaustion during rapid glissandos
+        while (allRunningVoices.size > 12) {
+            val oldest = allRunningVoices.poll()
+            if (oldest != null && oldest !== voice) {
+                oldest.isForceStopped = true
+                heldVoices.remove(oldest.noteId, oldest)
+            }
+        }
+
         scope.launch {
             val freq = 440.0 * 2.0.pow(semitoneFromA4 / 12.0)
-            val durationSeconds = when (instrument) {
-                Instrument.ORGAN -> (1.1 * sustainMultiplier).coerceAtMost(2.5)
-                Instrument.SYNTH -> (1.2 * sustainMultiplier).coerceAtMost(2.6)
-                else -> (1.5 * sustainMultiplier).coerceAtMost(3.2)
-            }
-            val numSamples = (durationSeconds * sampleRate).toInt()
-            val buffer = ShortArray(numSamples)
+            val chunkSamples = 512
+            val minBufBytes = AudioTrack.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            ).coerceAtLeast(chunkSamples * 4)
 
-            for (i in 0 until numSamples) {
-                val t = i.toDouble() / sampleRate
-                val sample = when (instrument) {
-                    Instrument.GRAND -> {
-                        val env = exp(-3.2 * t / sustainMultiplier) * (1.0 - exp(-220.0 * t))
-                        val wave = 0.60 * sin(2.0 * Math.PI * freq * t) +
-                                   0.25 * sin(4.0 * Math.PI * freq * t) +
-                                   0.10 * sin(6.0 * Math.PI * freq * t) +
-                                   0.05 * sin(8.0 * Math.PI * freq * t)
-                        wave * env
-                    }
-                    Instrument.EPIANO -> {
-                        val bodyEnv = exp(-2.4 * t / sustainMultiplier) * (1.0 - exp(-180.0 * t))
-                        val tineEnv = exp(-22.0 * t)
-                        val tremolo = 1.0 + 0.18 * sin(2.0 * Math.PI * 5.5 * t)
-                        val body = 0.65 * sin(2.0 * Math.PI * freq * t) +
-                                   0.20 * sin(4.0 * Math.PI * freq * t) +
-                                   0.08 * sin(6.0 * Math.PI * freq * t)
-                        val tine = 0.22 * sin(2.0 * Math.PI * freq * 7.0 * t) * tineEnv
-                        (body * bodyEnv + tine) * tremolo
-                    }
-                    Instrument.SYNTH -> {
-                        val env = exp(-2.0 * t / sustainMultiplier) * (1.0 - exp(-90.0 * t))
-                        val f1 = freq * 0.996
-                        val f2 = freq * 1.004
-                        var saw = 0.0
-                        for (h in 1..6) {
-                            saw += (sin(2.0 * Math.PI * f1 * h * t) + sin(2.0 * Math.PI * f2 * h * t)) / h
-                        }
-                        saw * 0.35 * env
-                    }
-                    Instrument.ORGAN -> {
-                        val fadeOut = if (t > durationSeconds - 0.08) ((durationSeconds - t) / 0.08).coerceIn(0.0, 1.0) else 1.0
-                        val env = (1.0 - exp(-140.0 * t)) * fadeOut
-                        val vibrato = 1.0 + 0.0025 * sin(2.0 * Math.PI * 6.2 * t)
-                        val vf = freq * vibrato
-                        val drawbars = 0.30 * sin(2.0 * Math.PI * (vf * 0.5) * t) +
-                                       0.45 * sin(2.0 * Math.PI * vf * t) +
-                                       0.22 * sin(2.0 * Math.PI * (vf * 1.5) * t) +
-                                       0.25 * sin(2.0 * Math.PI * (vf * 2.0) * t) +
-                                       0.15 * sin(2.0 * Math.PI * (vf * 3.0) * t) +
-                                       0.12 * sin(2.0 * Math.PI * (vf * 4.0) * t) +
-                                       0.08 * sin(2.0 * Math.PI * (vf * 6.0) * t)
-                        drawbars * 0.65 * env
-                    }
-                }
-                buffer[i] = (sample.coerceIn(-1.0, 1.0) * Short.MAX_VALUE * 0.48).toInt().toShort()
-            }
-
-            // Recycle oldest AudioTrack during fast glissandos to prevent voice exhaustion
-            while (activeTracks.size >= 14) {
-                val oldest = activeTracks.poll()
-                runCatching {
-                    oldest?.stop()
-                    oldest?.release()
-                }
-            }
-
-            runCatching {
-                val track = AudioTrack.Builder()
+            val track = runCatching {
+                AudioTrack.Builder()
                     .setAudioAttributes(
                         AudioAttributes.Builder()
                             .setUsage(AudioAttributes.USAGE_GAME)
@@ -156,19 +127,115 @@ class SynthEngine {
                             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                             .build()
                     )
-                    .setBufferSizeInBytes(buffer.size * 2)
-                    .setTransferMode(AudioTrack.MODE_STATIC)
+                    .setBufferSizeInBytes(minBufBytes)
+                    .setTransferMode(AudioTrack.MODE_STREAM)
                     .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                     .build()
+            }.getOrNull() ?: return@launch
 
-                activeTracks.add(track)
-                track.write(buffer, 0, buffer.size)
+            val buffer = ShortArray(chunkSamples)
+            var sampleIndex = 0L
+            var releaseSampleIndex = 0L
+
+            // Fast damp when Sustain is OFF; smooth pedal decay when Sustain is ON
+            val releaseRate = if (sustainEnabled) 2.8 else 22.0
+
+            runCatching {
                 track.play()
-                delay((durationSeconds * 1000).toLong() + 80)
-                activeTracks.remove(track)
+
+                while (!voice.isForceStopped) {
+                    var finishedRelease = false
+
+                    for (i in 0 until chunkSamples) {
+                        val t = sampleIndex.toDouble() / sampleRate
+                        sampleIndex++
+
+                        val releaseEnv = if (voice.isReleased) {
+                            val rt = releaseSampleIndex.toDouble() / sampleRate
+                            releaseSampleIndex++
+                            val env = exp(-releaseRate * rt)
+                            if (env < 0.002) finishedRelease = true
+                            env
+                        } else {
+                            1.0
+                        }
+
+                        val rawWave = when (instrument) {
+                            Instrument.GRAND -> {
+                                // Initial hammer punch settling into continuous string resonance while held
+                                val attack = 1.0 - exp(-220.0 * t)
+                                val hammerBoost = 0.72 + 0.28 * exp(-6.0 * t)
+                                val warmChorus = 1.0 + 0.0012 * sin(2.0 * Math.PI * 4.5 * t)
+                                val wave = 0.58 * sin(2.0 * Math.PI * freq * t) +
+                                           0.24 * sin(4.0 * Math.PI * (freq * warmChorus) * t) +
+                                           0.11 * sin(6.0 * Math.PI * freq * t) +
+                                           0.05 * sin(8.0 * Math.PI * freq * t)
+                                wave * attack * hammerBoost
+                            }
+                            Instrument.EPIANO -> {
+                                // Metallic Rhodes tine attack + continuous warm body with tremolo
+                                val attack = 1.0 - exp(-190.0 * t)
+                                val tineEnv = exp(-20.0 * t)
+                                val tremolo = 1.0 + 0.18 * sin(2.0 * Math.PI * 5.5 * t)
+                                val body = 0.65 * sin(2.0 * Math.PI * freq * t) +
+                                           0.22 * sin(4.0 * Math.PI * freq * t) +
+                                           0.09 * sin(6.0 * Math.PI * freq * t)
+                                val tine = 0.24 * sin(2.0 * Math.PI * freq * 7.0 * t) * tineEnv
+                                (body * attack + tine) * tremolo
+                            }
+                            Instrument.SYNTH -> {
+                                // Dual detuned sawtooth lead that sustains continuously at full power
+                                val attack = 1.0 - exp(-100.0 * t)
+                                val f1 = freq * 0.996
+                                val f2 = freq * 1.004
+                                var saw = 0.0
+                                for (h in 1..6) {
+                                    saw += (sin(2.0 * Math.PI * f1 * h * t) + sin(2.0 * Math.PI * f2 * h * t)) / h
+                                }
+                                saw * 0.34 * attack
+                            }
+                            Instrument.HARMONIUM -> {
+                                // Authentic Indian Reed Harmonium: Bellows air attack + dual detuned brass reeds
+                                val bellowsAttack = 1.0 - exp(-42.0 * t)
+                                val fMale = freq * 0.9985
+                                val fFemale = freq * 1.0015
+                                val reedWave =
+                                    0.42 * (sin(2.0 * Math.PI * fMale * t) + sin(2.0 * Math.PI * fFemale * t)) +
+                                    0.28 * (sin(4.0 * Math.PI * fMale * t) + sin(4.0 * Math.PI * fFemale * t)) +
+                                    0.18 * sin(6.0 * Math.PI * freq * t) +
+                                    0.10 * sin(8.0 * Math.PI * freq * t) +
+                                    0.06 * sin(10.0 * Math.PI * freq * t) +
+                                    0.03 * sin(12.0 * Math.PI * freq * t)
+                                reedWave * 0.52 * bellowsAttack
+                            }
+                        }
+
+                        val finalSample = (rawWave * releaseEnv).coerceIn(-1.0, 1.0)
+                        buffer[i] = (finalSample * Short.MAX_VALUE * 0.48).toInt().toShort()
+                    }
+
+                    track.write(buffer, 0, chunkSamples)
+                    if (finishedRelease) break
+                }
+            }
+
+            allRunningVoices.remove(voice)
+            heldVoices.remove(noteId, voice)
+            runCatching {
+                track.stop()
                 track.release()
             }
         }
+    }
+
+    fun stopNote(noteId: Int) {
+        heldVoices.remove(noteId)?.let { voice ->
+            voice.isReleased = true
+        }
+    }
+
+    fun stopAllNotes() {
+        heldVoices.keys.toList().forEach { stopNote(it) }
     }
 }
 
@@ -181,13 +248,18 @@ class MainActivity : ComponentActivity() {
             PianoAppScreen(synth)
         }
     }
+
+    override fun onStop() {
+        super.onStop()
+        synth.stopAllNotes()
+    }
 }
 
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun PianoAppScreen(synth: SynthEngine) {
     var octaveShift by remember { mutableStateOf(0) }
-    var sustainEnabled by remember { mutableStateOf(false) }
+    var sustainEnabled by remember { mutableStateOf(false) } // Disabled (OFF) by default
     var showNoteNames by remember { mutableStateOf(true) }
     var currentInstrument by remember { mutableStateOf(Instrument.GRAND) }
 
@@ -196,9 +268,10 @@ fun PianoAppScreen(synth: SynthEngine) {
     var recordStartTimeMs by remember { mutableStateOf(0L) }
     var loopDurationMs by remember { mutableStateOf(0L) }
     val recordedNotes = remember { mutableStateListOf<RecordedNote>() }
+    val activeRecordingStarts = remember { mutableStateMapOf<Int, Pair<Long, RecordedNote>>() }
     val loopActiveKeys = remember { mutableStateListOf<Int>() }
 
-    // Multi-touch pointer tracking map (pointerId -> noteOffset) for smooth glissando
+    // Multi-touch pointer tracking map (pointerId -> noteOffset) for smooth glissando & hold
     val pointerToKey = remember { mutableStateMapOf<Int, Int>() }
     var canvasSize by remember { mutableStateOf(IntSize(2408, 1080)) }
     val keys = remember { buildTwoOctaveLayout() }
@@ -223,10 +296,11 @@ fun PianoAppScreen(synth: SynthEngine) {
         }
     }
 
-    // Coroutine for continuous Loop Playback
+    // Coroutine for continuous Loop Playback with recorded hold durations
     LaunchedEffect(loopState) {
         if (loopState == LoopState.PLAYING && recordedNotes.isNotEmpty() && loopDurationMs > 0L) {
             val snapshot = recordedNotes.toList().sortedBy { it.timeOffsetMs }
+            var loopVoiceCounter = 10000
             while (isActive && loopState == LoopState.PLAYING) {
                 var elapsedMs = 0L
                 for (event in snapshot) {
@@ -236,14 +310,18 @@ fun PianoAppScreen(synth: SynthEngine) {
                     elapsedMs = event.timeOffsetMs
 
                     if (loopState == LoopState.PLAYING) {
-                        synth.playNote(
+                        val voiceId = loopVoiceCounter++
+                        val holdMs = event.holdDurationMs.coerceIn(120L, 6000L)
+                        synth.startNote(
+                            noteId = voiceId,
                             semitoneFromA4 = event.noteOffset + (event.octaveShift * 12),
                             instrument = event.instrument,
-                            sustainMultiplier = if (event.sustainEnabled) 1.7 else 0.7
+                            sustainEnabled = event.sustainEnabled
                         )
                         launch {
                             loopActiveKeys.add(event.noteOffset)
-                            delay(180L)
+                            delay(holdMs)
+                            synth.stopNote(voiceId)
                             loopActiveKeys.remove(event.noteOffset)
                         }
                     }
@@ -256,26 +334,35 @@ fun PianoAppScreen(synth: SynthEngine) {
         }
     }
 
-    fun triggerNote(noteOffset: Int) {
-        synth.playNote(
+    fun pressNote(noteOffset: Int) {
+        synth.startNote(
+            noteId = noteOffset,
             semitoneFromA4 = noteOffset + (octaveShift * 12),
             instrument = currentInstrument,
-            sustainMultiplier = if (sustainEnabled) 1.7 else 0.7
+            sustainEnabled = sustainEnabled
         )
         if (loopState == LoopState.RECORDING) {
             val now = System.currentTimeMillis()
             if (recordedNotes.isEmpty()) {
                 recordStartTimeMs = now
             }
-            recordedNotes.add(
-                RecordedNote(
-                    timeOffsetMs = (now - recordStartTimeMs).coerceAtLeast(0L),
-                    noteOffset = noteOffset,
-                    octaveShift = octaveShift,
-                    instrument = currentInstrument,
-                    sustainEnabled = sustainEnabled
-                )
+            val recNote = RecordedNote(
+                timeOffsetMs = (now - recordStartTimeMs).coerceAtLeast(0L),
+                noteOffset = noteOffset,
+                octaveShift = octaveShift,
+                instrument = currentInstrument,
+                sustainEnabled = sustainEnabled,
+                holdDurationMs = 400L
             )
+            recordedNotes.add(recNote)
+            activeRecordingStarts[noteOffset] = Pair(now, recNote)
+        }
+    }
+
+    fun releaseNote(noteOffset: Int) {
+        synth.stopNote(noteOffset)
+        activeRecordingStarts.remove(noteOffset)?.let { (pressTime, recNote) ->
+            recNote.holdDurationMs = (System.currentTimeMillis() - pressTime).coerceAtLeast(100L)
         }
     }
 
@@ -292,7 +379,7 @@ fun PianoAppScreen(synth: SynthEngine) {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            // 1. Instrument Selector Buttons
+            // 1. Instrument Selector Buttons (Grand, E-Piano, Synth, Harmonium)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Instrument.values().forEach { inst ->
                     val selected = currentInstrument == inst
@@ -309,10 +396,16 @@ fun PianoAppScreen(synth: SynthEngine) {
                 }
             }
 
-            // 2. Octave & Note Label Toggle
+            // 2. Octave, Note Names & Sustain Controls
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Button(
-                    onClick = { if (octaveShift > -2) octaveShift-- },
+                    onClick = {
+                        if (octaveShift > -2) {
+                            synth.stopAllNotes()
+                            pointerToKey.clear()
+                            octaveShift--
+                        }
+                    },
                     contentPadding = compactPadding,
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF333333)),
                     modifier = Modifier.height(38.dp)
@@ -326,7 +419,13 @@ fun PianoAppScreen(synth: SynthEngine) {
                 )
 
                 Button(
-                    onClick = { if (octaveShift < 2) octaveShift++ },
+                    onClick = {
+                        if (octaveShift < 2) {
+                            synth.stopAllNotes()
+                            pointerToKey.clear()
+                            octaveShift++
+                        }
+                    },
                     contentPadding = compactPadding,
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF333333)),
                     modifier = Modifier.padding(end = 6.dp).height(38.dp)
@@ -344,7 +443,7 @@ fun PianoAppScreen(synth: SynthEngine) {
                     Text(if (showNoteNames) "Notes: ON" else "Notes: OFF", fontSize = 12.sp)
                 }
 
-                // Sustain Toggle
+                // Sustain Toggle (OFF by default)
                 Button(
                     onClick = { sustainEnabled = !sustainEnabled },
                     contentPadding = compactPadding,
@@ -364,6 +463,7 @@ fun PianoAppScreen(synth: SynthEngine) {
                         Button(
                             onClick = {
                                 recordedNotes.clear()
+                                activeRecordingStarts.clear()
                                 recordStartTimeMs = System.currentTimeMillis()
                                 loopState = LoopState.RECORDING
                             },
@@ -387,10 +487,16 @@ fun PianoAppScreen(synth: SynthEngine) {
                     LoopState.RECORDING -> {
                         Button(
                             onClick = {
+                                val now = System.currentTimeMillis()
+                                activeRecordingStarts.forEach { (_, pair) ->
+                                    pair.second.holdDurationMs = (now - pair.first).coerceAtLeast(100L)
+                                }
+                                activeRecordingStarts.clear()
+
                                 if (recordedNotes.isEmpty()) {
                                     loopState = LoopState.IDLE
                                 } else {
-                                    loopDurationMs = (System.currentTimeMillis() - recordStartTimeMs).coerceAtLeast(400L)
+                                    loopDurationMs = (now - recordStartTimeMs).coerceAtLeast(400L)
                                     loopState = LoopState.PLAYING
                                 }
                             },
@@ -415,7 +521,7 @@ fun PianoAppScreen(synth: SynthEngine) {
             }
         }
 
-        // Multi-Touch + Glissando Piano Canvas
+        // Multi-Touch + Continuous Hold + Glissando Piano Canvas
         Box(modifier = Modifier.fillMaxSize()) {
             Canvas(
                 modifier = Modifier
@@ -440,24 +546,45 @@ fun PianoAppScreen(synth: SynthEngine) {
 
                                     if (hitKey != null) {
                                         if (prevNote != hitKey.noteOffset) {
-                                            pointerToKey[pid] = hitKey.noteOffset
-                                            triggerNote(hitKey.noteOffset)
+                                            val newNote = hitKey.noteOffset
+                                            val wasNewNoteAlreadyPressed = pointerToKey.containsValue(newNote)
+                                            pointerToKey[pid] = newNote
+
+                                            if (prevNote != null && !pointerToKey.containsValue(prevNote)) {
+                                                releaseNote(prevNote)
+                                            }
+                                            if (!wasNewNoteAlreadyPressed) {
+                                                pressNote(newNote)
+                                            }
                                         }
                                     } else {
                                         pointerToKey.remove(pid)
+                                        if (prevNote != null && !pointerToKey.containsValue(prevNote)) {
+                                            releaseNote(prevNote)
+                                        }
                                     }
                                 }
-                                // Clean up any stale pointers
-                                val stale = pointerToKey.keys.filter { it !in currentPointerIds }
-                                stale.forEach { pointerToKey.remove(it) }
+                                // Clean up any stale pointers and release their notes
+                                val stalePids = pointerToKey.keys.filter { it !in currentPointerIds }
+                                stalePids.forEach { pid ->
+                                    val oldNote = pointerToKey.remove(pid)
+                                    if (oldNote != null && !pointerToKey.containsValue(oldNote)) {
+                                        releaseNote(oldNote)
+                                    }
+                                }
                             }
                             MotionEvent.ACTION_POINTER_UP -> {
                                 val liftedPid = event.getPointerId(event.actionIndex)
-                                pointerToKey.remove(liftedPid)
+                                val oldNote = pointerToKey.remove(liftedPid)
+                                if (oldNote != null && !pointerToKey.containsValue(oldNote)) {
+                                    releaseNote(oldNote)
+                                }
                             }
                             MotionEvent.ACTION_UP,
                             MotionEvent.ACTION_CANCEL -> {
+                                val activeNotes = pointerToKey.values.toSet()
                                 pointerToKey.clear()
+                                activeNotes.forEach { releaseNote(it) }
                             }
                         }
                         true
