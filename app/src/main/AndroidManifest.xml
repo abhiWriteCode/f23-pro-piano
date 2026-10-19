@@ -7,7 +7,9 @@
 
     <application
         android:allowBackup="true"
-        android:label="Pro Piano F23"
+        android:icon="@drawable/ic_piano"
+        android:roundIcon="@drawable/ic_piano"
+        android:label="Piano F23"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
         <activity
             android:name=".MainActivity"
